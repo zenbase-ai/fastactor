@@ -1,12 +1,18 @@
 from abc import ABC
 from dataclasses import dataclass, field
 from uuid import uuid4
+import asyncio
 import logging
 import os
 import random
 import typing as t
 
-from anyio import create_memory_object_stream, create_task_group, fail_after
+from anyio import (
+    Event,
+    create_memory_object_stream,
+    create_task_group,
+    fail_after,
+)
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pyee.asyncio import AsyncIOEventEmitter
 
@@ -20,10 +26,11 @@ def gen_id():
     return str(uuid4())
 
 
-@dataclass(frozen=True)
+@dataclass
 class Call[T]:
+    sender: "Actor"
     request: T
-    _callback_stream: MemoryObjectSendStream[T]
+    _response_stream: MemoryObjectSendStream[T]
 
     id: str = field(default_factory=gen_id)
 
@@ -31,8 +38,9 @@ class Call[T]:
         return f"Call({self.id})"
 
 
-@dataclass(frozen=True)
+@dataclass
 class Cast[T]:
+    sender: "Actor"
     request: T
 
     id: str = field(default_factory=gen_id)
@@ -41,7 +49,7 @@ class Cast[T]:
         return f"Cast({self.id})"
 
 
-@dataclass(frozen=True)
+@dataclass
 class Actor[Req](ABC):
     """
     An actor that can handle call and cast messages.
@@ -55,9 +63,15 @@ class Actor[Req](ABC):
     inbox: MemoryObjectSendStream[Req] = field(init=False, default=None)
     mailbox: MemoryObjectReceiveStream[Req] = field(init=False, default=None)
 
+    _started: Event = field(init=False, default_factory=Event)
+
+    async def started(self):
+        return await self._started.wait()
+
     async def init(self):
         """Any async startup code should go here."""
         self.inbox, self.mailbox = create_memory_object_stream(self.mailbox_size)
+        self._started.set()
 
     async def handle_call(self, sender: "Actor", message: Req) -> t.Any:
         """Handle a call message. Return a response."""
@@ -70,15 +84,15 @@ class Actor[Req](ABC):
     ](self, receiver: "Actor", req: Req, timeout: float | None = 5) -> Res:
         send_stream, receive_stream = create_memory_object_stream(1)
 
-        receiver.inbox.send_nowait(Call(req, _callback_stream=send_stream))
+        receiver.inbox.send_nowait(Call(self, req, _response_stream=send_stream))
 
         with fail_after(timeout):
             response = await receive_stream.receive()
 
         return response
 
-    def cast(self, receiver: "Actor", message: Req) -> None:
-        receiver.inbox.send_nowait(Cast(message))
+    async def cast(self, receiver: "Actor", message: Req) -> None:
+        await receiver.inbox.send(Cast(self, message))
 
     async def loop(self):
         await self.init()
@@ -87,26 +101,28 @@ class Actor[Req](ABC):
                 await runtime.perform(self, message)
 
 
+# TODO: Productionization — durable restarts — Redis? Kafka?
 class Runtime:
     events: AsyncIOEventEmitter
 
     def __init__(self) -> None:
         self.events = AsyncIOEventEmitter()
 
-    async def perform(self, actor: Actor, message: Call | Cast):
-        kind = message.__class__.__name__.lower()
-        self.events.emit("before:perform", message)
-        self.events.emit(f"before:{kind}", message)
+    async def perform(self, actor: Actor, msg: Call | Cast):
+        kind = msg.__class__.__name__.lower()
+        self.events.emit("before:perform", msg)
+        self.events.emit(f"before:{kind}", msg)
 
-        match message:
+        match msg:
             case Call():
-                response = await actor.handle_call(message.request)
-                message._callback_stream.send_nowait(response)
+                response = await actor.handle_call(msg.sender, msg.request)
+                msg._response_stream.send_nowait(response)
             case Cast():
-                response: None = await actor.handle_cast(message.request)
+                await actor.handle_cast(msg.sender, msg.request)
+                response = None
 
-        self.events.emit(f"after:{kind}", message, response)
-        self.events.emit("after:perform", message, response)
+        self.events.emit(f"after:{kind}", msg, response)
+        self.events.emit("after:perform", msg, response)
 
         return response
 
@@ -122,7 +138,7 @@ class Supervisor(Actor):
             try:
                 await task()
             except Exception as exc:
-                logger.warning("Actor crashed", exc)
+                logger.warning("Actor crashed", exc_info=exc)
                 max_restarts -= 1
                 if max_restarts == 0:
                     logger.error("Max restarts reached. Actor will not be restarted.")
@@ -145,20 +161,26 @@ class Supervisor(Actor):
 
             await cls.run(run_tasks, tasks, max_restarts)
 
-    children: list[Actor]
+    children: list[Actor] = field(default_factory=list)
     strategy: t.Callable = field(default=Strategy.one_for_one)
-    max_restarts: int = field(defualt=3)
+    max_restarts: int = field(default=3)
+
+    async def started(self):
+        await asyncio.gather(
+            super().started(), *[actor.started() for actor in self.children]
+        )
 
     async def loop(self):
         async with create_task_group() as tg:
-            await tg.start(super().loop)
-            await tg.start(
+            tg.start_soon(super().loop)
+            tg.start_soon(
                 self.strategy,
                 [actor.loop for actor in self.children],
                 self.max_restarts,
             )
 
 
+# Modelled after https://elixirschool.com/en/lessons/misc/poolboy
 @dataclass
 class WorkerPool(Supervisor, ABC):
     """
@@ -171,36 +193,10 @@ class WorkerPool(Supervisor, ABC):
 
     async def loop(self):
         async with create_task_group() as tg:
-            await tg.start(super().loop)
+            tg.start_soon(super().loop)
+
+            await self.started()
 
             async for message in self.mailbox:
                 worker = await self.router(message)
                 worker.inbox.send_nowait(message)
-
-
-# To customize for your own app, import these llegos and subclass them with your own logic.
-
-
-class AppRuntime(Runtime):
-    async def perform(self, actor: Actor, message: Call | Cast):
-        response = await super().perform(actor, message)
-        print(f"Actor {actor.id} received {message} and responded with {response}")
-        return response
-
-
-runtime = AppRuntime()
-
-
-class AppActor(Actor):
-    async def handle_call(self, sender: Actor, message):
-        match message:
-            case "ping":
-                return "pong"
-            case "pong":
-                return "ping"
-
-
-worker_pool = WorkerPool(
-    children=[AppActor(), AppActor(), AppActor()],
-    strategy=Supervisor.Strategy.one_for_all,
-)
