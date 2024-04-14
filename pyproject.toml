@@ -7,6 +7,7 @@ authors = [
 ]
 dependencies = [
     "anyio>=4.3.0",
+    "pyee>=11.1.0",
 ]
 readme = "README.md"
 requires-python = ">= 3.8"

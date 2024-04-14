@@ -64,6 +64,8 @@ pydantic==2.7.0
     # via openai
 pydantic-core==2.18.1
     # via pydantic
+pyee==11.1.0
+    # via llegos
 pygments==2.17.2
     # via ipython
 pytest==8.1.1
@@ -86,5 +88,6 @@ typing-extensions==4.11.0
     # via openai
     # via pydantic
     # via pydantic-core
+    # via pyee
 wcwidth==0.2.13
     # via prompt-toolkit
