@@ -34,11 +34,13 @@ logger = logging.getLogger(__name__)
 # Exceptions
 # -----------------------------------------------------------
 class Crashed(Exception):
-    pass
+    def __init__(self, reason: str):
+        self.reason = reason
 
 
 class Failed(Exception):
-    pass
+    def __init__(self, reason: str):
+        self.reason = reason
 
 
 class Shutdown(Exception):
@@ -50,11 +52,13 @@ class Shutdown(Exception):
 # Helpers
 # -----------------------------------------------------------
 def _is_normal_shutdown_reason(reason: t.Any) -> bool:
-    if reason in ("normal", "shutdown"):
-        return True
-    if isinstance(reason, tuple) and len(reason) > 0 and reason[0] == "shutdown":
-        return True
-    return False
+    match reason:
+        case "normal" | "shutdown":
+            return True
+        case Shutdown():
+            return True
+        case _:
+            return False
 
 
 # -----------------------------------------------------------
@@ -181,6 +185,7 @@ class Process:
         if self.monitored_by:
             logger.debug("%s notifying monitors", self)
             for process in list(self.monitored_by):
+                process.demonitor(self)
                 try:
                     await process.send(Down(self, reason))
                 except Exception as error:
@@ -193,9 +198,10 @@ class Process:
                     )
 
         if self.links:
-            abnormal_shutdown = not _is_normal_shutdown_reason(reason)
             logger.debug("%s notifying links", self)
+            abnormal_shutdown = not _is_normal_shutdown_reason(reason)
             for process in list(self.links):
+                self.unlink(process)
                 if process.trap_exits:
                     try:
                         await process.send(Exit(self, reason))
@@ -208,21 +214,17 @@ class Process:
                             process,
                         )
                 elif abnormal_shutdown:
-                    if isinstance(reason, Exception):
-                        process._crash_exc = reason
-                    else:
-                        process._crash_exc = Crashed(str(reason))
+                    process._crash_exc = (
+                        reason
+                        if isinstance(reason, Exception)
+                        else Crashed(str(reason))
+                    )
                     try:
-                        await process.kill()
+                        await process.stop(reason)
                     except Exception as error:
                         logger.error("%r killing %s: %s", error, process, reason)
 
-        logger.debug("%s unlinking", self)
-        for process in list(self.links):
-            process.unlink(self)
         for process in list(self.monitors):
-            process.demonitor(self)
-        for process in list(self.monitored_by):
             process.demonitor(self)
 
         Runtime.current().unregister(self)
@@ -290,8 +292,12 @@ class Process:
             reason = "normal"
             try:
                 await self._loop()
+            except ClosedResourceError:
+                reason = "killed"
             except Shutdown as error:
-                reason = error.reason
+                if not _is_normal_shutdown_reason(error.reason):
+                    reason = error.reason
+                    self._crash_exc = Crashed(str(reason))
             except Exception as error:
                 self._crash_exc = error
                 reason = error
@@ -321,8 +327,13 @@ class Process:
         match message:
             case Stop(_, reason):
                 raise Shutdown(reason)
-            case Exit():
-                await self.handle_exit(message)
+            case Exit(_, reason):
+                if not self.trap_exits and not _is_normal_shutdown_reason(reason):
+                    self.unlink(message.sender)
+                    self._crash_exc = Crashed(str(reason))
+                    raise Shutdown(reason)
+                else:
+                    await self.handle_exit(message)
             case _:
                 # Unrecognized => treat as info by default
                 await self.handle_info(message)
@@ -639,6 +650,10 @@ class Supervisor(Process):
                 reason = "normal"
                 try:
                     await self._loop()
+                except Shutdown as error:
+                    reason = error.reason
+                except ClosedResourceError:
+                    reason = "killed"
                 except Exception as error:
                     self._crash_exc = error
                     reason = error
@@ -767,7 +782,7 @@ class Runtime:
     async def __aenter__(self):
         async with self._lock:
             if Runtime._current is not None:
-                return Runtime._current
+                raise RuntimeError("Runtime already started")
 
             self._task_group = await create_task_group().__aenter__()
             self.supervisor = RuntimeSupervisor(trap_exits=True)
@@ -789,12 +804,14 @@ class Runtime:
             Runtime._current = None
 
     async def spawn[P: Process](self, process: P, *args, **kwargs) -> P:
-        if not process.has_stopped():
-            self._task_group.start_soon(process.loop, args, kwargs)
-            await process.started()
+        self._task_group.start_soon(process.loop, args, kwargs)
+        await process.started()
 
-            self.register(process)
-            return process
+        if process.has_stopped():
+            raise RuntimeError("Process crashed before it could start")
+
+        self.register(process)
+        return process
 
     def register(self, proc: Process):
         self.processes[proc.id] = proc

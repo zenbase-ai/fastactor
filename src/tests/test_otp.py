@@ -5,6 +5,7 @@ import asyncio
 from fastactor.otp import (
     Call,
     Cast,
+    Crashed,
     Down,
     Exit,
     Runtime,
@@ -273,6 +274,8 @@ async def test_linking_trap_exits(runtime: Runtime):
 
 
 class MonitorServer(GenServer):
+    down_msgs: list[Down]
+
     async def init(self, *args, **kwargs):
         self.down_msgs = []
 
@@ -289,14 +292,14 @@ async def test_monitoring(runtime: Runtime):
     """
 
     M = await MonitorServer.start()
-    T_ = await GenServer.start()
+    T = await GenServer.start()
 
     # M monitors T
-    M.monitor(T_)
+    M.monitor(T)
 
     # T stops normally
-    await T_.stop("normal")
-    await T_.stopped()
+    await T.stop("normal")
+    await T.stopped()
 
     # M remains alive
     assert not M.has_stopped()
@@ -304,9 +307,9 @@ async def test_monitoring(runtime: Runtime):
     # M should eventually get a Down message
     await asyncio.sleep(0.2)
     assert len(M.down_msgs) == 1
-    down: Down = M.down_msgs[0]
-    assert down.reason == "normal"
-    assert down.sender == T_
+    msg = M.down_msgs[0]
+    assert msg.reason == "normal"
+    assert msg.sender == T
 
     # stop M
     await M.stop("normal")
@@ -320,15 +323,14 @@ async def test_chain_crash_via_linking(runtime: Runtime):
     => all removed
     """
 
-    X = await GenServer.start(trap_exits=False)
-    Y = await GenServer.start(trap_exits=False)
-    Z = await GenServer.start(trap_exits=False)
+    X = await GenServer.start()
+    Y = await GenServer.start()
+    Z = await GenServer.start()
 
     X.link(Y)
     Y.link(Z)
 
-    await Z.stop("fatal")
-    await Z.stopped()
+    await X.stop("fatal")
 
     # chain reaction => Y, then X => all gone
     await asyncio.sleep(0.3)
@@ -336,9 +338,9 @@ async def test_chain_crash_via_linking(runtime: Runtime):
     assert X.has_stopped()
     assert Y.has_stopped()
     # all have abnormal reason
-    assert X._crash_exc == "fatal"
-    assert Y._crash_exc == "fatal"
-    assert Z._crash_exc == "fatal"
+    assert isinstance(X._crash_exc, Crashed) and X._crash_exc.reason == "fatal"
+    assert isinstance(Y._crash_exc, Crashed) and Y._crash_exc.reason == "fatal"
+    assert isinstance(Z._crash_exc, Crashed) and Z._crash_exc.reason == "fatal"
 
 
 class CrashyServer(GenServer):
@@ -346,24 +348,24 @@ class CrashyServer(GenServer):
         raise RuntimeError("I always crash")
 
 
-async def test_supervisor_crash(runtime: Runtime):
+async def test_supervisor_crash(runtime: Runtime, supervisor: Supervisor):
     """
     G: Sup3 with max_restarts=2, child that always crashes => 3 crashes => sup fails
     W: child keeps failing, eventually sup => ActorFailed
     T: sup removed, any watchers notified
     """
 
-    sup3_spec = runtime.supervisor.child_spec(
-        Supervisor, kwargs={"max_restarts": 2, "max_seconds": 5}
+    sup = await supervisor.start_child(
+        "sup3",
+        supervisor.child_spec(Supervisor, kwargs={"max_restarts": 2, "max_seconds": 5}),
     )
-    sup3 = await runtime.supervisor.start_child("sup3", sup3_spec)
 
     # add child that always crashes on startup
     with pytest.raises(Failed, match="Max restart intensity reached"):
-        await sup3.start_child(
-            "bad_child", sup3.child_spec(CrashyServer, restart="transient")
+        await sup.start_child(
+            "bad_child", sup.child_spec(CrashyServer, restart="transient")
         )
-        await sup3.stopped()
+        await sup.stopped()
 
     # sup3 should be removed from parent's children
     assert "sup3" not in runtime.supervisor.children
