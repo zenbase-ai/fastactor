@@ -1,5 +1,5 @@
 from abc import ABC
-from asyncio import CancelledError, gather, as_completed
+from asyncio import gather, as_completed
 from collections import deque
 from dataclasses import dataclass, field
 from time import monotonic
@@ -14,12 +14,9 @@ from anyio import (
     Event,
     fail_after,
     Lock,
-    TASK_STATUS_IGNORED,
 )
-from anyio.abc import TaskGroup, TaskStatus
+from anyio.abc import TaskGroup
 from anyio.streams.memory import MemoryObjectSendStream, MemoryObjectReceiveStream
-
-from beartype import beartype
 from sorcery import dict_of
 
 # Adjust these to your actual import paths
@@ -40,16 +37,13 @@ class Crashed(Exception):
     pass
 
 
-class ActorFailed(Exception):
+class Failed(Exception):
     pass
 
 
-class SystemNotAvailable(RuntimeError):
-    pass
-
-
-class SystemAlreadyActive(RuntimeError):
-    pass
+class Shutdown(Exception):
+    def __init__(self, reason: t.Any):
+        self.reason = reason
 
 
 # -----------------------------------------------------------
@@ -146,7 +140,7 @@ class Process:
             case Stop(_, reason):
                 self._started.set()
                 self._stopped.set()
-                raise RuntimeError(f"Process init stopped: {reason}")
+                raise Shutdown(reason)
             case _:
                 self._inbox, self._mailbox = create_memory_object_stream(
                     settings.mailbox_size
@@ -183,43 +177,45 @@ class Process:
         Subclasses can override for final cleanup.
         """
         logger.debug("%s terminate reason=%s", self, reason)
-        # Notify monitors about our exit
-        logger.debug("%s notifying monitors", self)
-        for process in list(self.monitors):
-            try:
-                await process.send(Down(self, reason))
-            except Exception as error:
-                logger.error(
-                    "%r sending Down(%s, %s) to monitor: %s",
-                    error,
-                    self,
-                    reason,
-                    process,
-                )
 
-        abnormal_shutdown = not _is_normal_shutdown_reason(reason)
-        logger.debug("%s notifying links", self)
-        for process in list(self.links):
-            if process.trap_exits:
+        if self.monitored_by:
+            logger.debug("%s notifying monitors", self)
+            for process in list(self.monitored_by):
                 try:
-                    await process.send(Exit(self, reason))
+                    await process.send(Down(self, reason))
                 except Exception as error:
                     logger.error(
-                        "%r sending Exit(%s, %s) to linked actor: %s",
+                        "%r sending Down(%s, %s) to monitor: %s",
                         error,
                         self,
                         reason,
                         process,
                     )
-            elif abnormal_shutdown:
-                if isinstance(reason, Exception):
-                    process._crash_exc = reason
-                else:
-                    process._crash_exc = Crashed(str(reason))
-                try:
-                    await process.kill()
-                except Exception as error:
-                    logger.error("%r killing %s: %s", error, process, reason)
+
+        if self.links:
+            abnormal_shutdown = not _is_normal_shutdown_reason(reason)
+            logger.debug("%s notifying links", self)
+            for process in list(self.links):
+                if process.trap_exits:
+                    try:
+                        await process.send(Exit(self, reason))
+                    except Exception as error:
+                        logger.error(
+                            "%r sending Exit(%s, %s) to linked actor: %s",
+                            error,
+                            self,
+                            reason,
+                            process,
+                        )
+                elif abnormal_shutdown:
+                    if isinstance(reason, Exception):
+                        process._crash_exc = reason
+                    else:
+                        process._crash_exc = Crashed(str(reason))
+                    try:
+                        await process.kill()
+                    except Exception as error:
+                        logger.error("%r killing %s: %s", error, process, reason)
 
         logger.debug("%s unlinking", self)
         for process in list(self.links):
@@ -285,6 +281,24 @@ class Process:
     async def handle_info(self, message: Message): ...
 
     # --------------- Internal Loop --------------- #
+    async def loop(self, args, kwargs):
+        """
+        Wraps `_loop` in a try/finally to detect crashes. Subclasses can override or extend.
+        """
+        await self._init(*args, **kwargs)
+        async with self._mailbox:
+            reason = "normal"
+            try:
+                await self._loop()
+            except Shutdown as error:
+                reason = error.reason
+            except Exception as error:
+                self._crash_exc = error
+                reason = error
+            finally:
+                await self.terminate(reason)
+                self._stopped.set()
+
     async def _loop(self):
         """
         The main loop: reads messages, calls `_handle_message`.
@@ -298,41 +312,20 @@ class Process:
             except (EndOfStream, ClosedResourceError):
                 break
 
-            keep_going = await self._handle_message(message)
-            if not keep_going:
-                break
+            await self._handle_message(message)
 
     async def _handle_message(self, message: Message) -> bool:
         """
         Returns True to keep going, False to break the loop.
         """
         match message:
-            case Stop():
-                # We are told to stop
-                return False
+            case Stop(_, reason):
+                raise Shutdown(reason)
             case Exit():
                 await self.handle_exit(message)
-                return True
             case _:
                 # Unrecognized => treat as info by default
                 await self.handle_info(message)
-                return True
-
-    async def loop(self, args, kwargs):
-        """
-        Wraps `_loop` in a try/finally to detect crashes. Subclasses can override or extend.
-        """
-        await self._init(*args, **kwargs)
-        async with self._mailbox:
-            reason = "normal"
-            try:
-                await self._loop()
-            except Exception as error:
-                self._crash_exc = error
-                reason = error
-            finally:
-                await self.terminate(reason)
-                self._stopped.set()
 
     @classmethod
     async def start(
@@ -403,13 +396,13 @@ class GenServer(Process):
     """
 
     # Overridable callbacks
-    async def handle_call(self, sender: "Process", request: t.Any) -> t.Any:
+    async def handle_call(self, request: t.Any) -> t.Any:
         return None
 
-    async def handle_cast(self, sender: "Process", request: t.Any) -> t.Any:
+    async def handle_cast(self, request: t.Any) -> t.Any:
         pass
 
-    async def handle_info(self, sender: "Process", message: t.Any):
+    async def handle_info(self, message: t.Any):
         pass
 
     # Public API for user code
@@ -580,7 +573,7 @@ class Supervisor(Process):
             while restart_times and now - restart_times[0] > self.max_seconds:
                 restart_times.popleft()
             if len(restart_times) > self.max_restarts:
-                raise ActorFailed("Max restart intensity reached")
+                raise Failed("Max restart intensity reached")
 
         del self.children[child_id]
 
@@ -630,7 +623,7 @@ class Supervisor(Process):
                 while restarts and now - restarts[0] > self.max_seconds:
                     restarts.popleft()
                 if len(restarts) > self.max_restarts:
-                    raise ActorFailed("Max restart intensity reached")
+                    raise Failed("Max restart intensity reached")
             else:
                 break
             self.children.clear()
@@ -768,7 +761,7 @@ class Runtime:
     @classmethod
     def current(cls) -> "Runtime":
         if cls._current is None:
-            raise SystemNotAvailable("No System is currently active.")
+            raise RuntimeError("No Runtime is currently active.")
         return cls._current
 
     async def __aenter__(self):

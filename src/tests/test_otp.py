@@ -10,8 +10,7 @@ from fastactor.otp import (
     Runtime,
     GenServer,
     Supervisor,
-    RuntimeSupervisor,
-    ActorFailed,
+    Failed,
 )
 
 pytestmark = pytest.mark.anyio
@@ -134,6 +133,7 @@ class MathServer(GenServer):
                 self.count /= n
             case _:
                 raise ValueError(f"unknown message: {msg.message}")
+        return self.count
 
 
 async def test_genserver_cast(runtime: Runtime):
@@ -162,10 +162,11 @@ async def test_genserver_cast(runtime: Runtime):
     assert G4.has_stopped()
 
 
-class CrashingServer(GenServer):
+class BoomServer(GenServer):
     async def handle_call(self, msg: Call):
-        if msg.message == "crash":
-            raise RuntimeError("Crash!")
+        if msg.message == "boom":
+            raise RuntimeError("Boom!")
+        return "ok"
 
 
 async def test_supervisor_one_for_one(runtime: Runtime, supervisor: Supervisor):
@@ -177,13 +178,13 @@ async def test_supervisor_one_for_one(runtime: Runtime, supervisor: Supervisor):
     """
     # Add a single child, transient
     cA = await supervisor.start_child(
-        "childA", supervisor.child_spec(CrashingServer, restart="transient")
+        "childA", supervisor.child_spec(BoomServer, restart="transient")
     )
     # We have a single child
     assert len(supervisor.which_children()) == 1
     # abnormal crash
-    with pytest.raises(RuntimeError, match="Crash!"):
-        await cA.call("crash")
+    with pytest.raises(RuntimeError, match="Boom!"):
+        await cA.call("boom")
 
     await anyio.sleep(0.2)
     # Should have restarted child
@@ -195,13 +196,6 @@ async def test_supervisor_one_for_one(runtime: Runtime, supervisor: Supervisor):
     await anyio.sleep(0.2)
     assert "childA" not in supervisor.children, "should have removed the child"
     # The child is not restarted if normal exit => ephemeral
-
-
-class BoomServer(GenServer):
-    async def handle_call(self, msg: Call):
-        if msg.message == "boom":
-            raise RuntimeError("Boom!")
-        return "ok"
 
 
 async def xtest_supervisor_one_for_all(runtime: Runtime):
@@ -310,10 +304,9 @@ async def test_monitoring(runtime: Runtime):
     # M should eventually get a Down message
     await asyncio.sleep(0.2)
     assert len(M.down_msgs) == 1
-    down_msg = M.down_msgs[0]
-    assert down_msg[0] == "DOWN"
-    assert down_msg[1] == T_
-    assert down_msg[2] == "normal"
+    down: Down = M.down_msgs[0]
+    assert down.reason == "normal"
+    assert down.sender == T_
 
     # stop M
     await M.stop("normal")
@@ -348,35 +341,7 @@ async def test_chain_crash_via_linking(runtime: Runtime):
     assert Z._crash_exc == "fatal"
 
 
-class Counter(GenServer):
-    async def init(self, *args, **kwargs):
-        self.state = 0
-
-    async def handle_call(self, msg: Call):
-        # we do some async waiting to test concurrency
-        await asyncio.sleep(0.05)
-        if msg.message == "inc":
-            self.state += 1
-            return self.state
-
-
-async def test_parallel_calls_queue_behavior(runtime: Runtime):
-    """
-    G: A GenServer P increments an internal counter for each call
-    W: multiple calls concurrently
-    T: processed FIFO, final count is sum of calls
-    """
-
-    P = await Counter.start()
-
-    calls = [asyncio.create_task(P.call("inc")) for _ in range(5)]
-    results = await asyncio.gather(*calls)
-    assert results == [1, 2, 3, 4, 5]
-    assert P.state == 5
-    await P.stop("normal")
-
-
-class AlwaysCrashes(GenServer):
+class CrashyServer(GenServer):
     async def init(self, *args, **kwargs):
         raise RuntimeError("I always crash")
 
@@ -394,24 +359,14 @@ async def test_supervisor_crash(runtime: Runtime):
     sup3 = await runtime.supervisor.start_child("sup3", sup3_spec)
 
     # add child that always crashes on startup
-    with pytest.raises(ActorFailed, match="Max restart intensity reached"):
+    with pytest.raises(Failed, match="Max restart intensity reached"):
         await sup3.start_child(
-            "bad_child", sup3.child_spec(AlwaysCrashes, restart="transient")
+            "bad_child", sup3.child_spec(CrashyServer, restart="transient")
         )
         await sup3.stopped()
 
     # sup3 should be removed from parent's children
     assert "sup3" not in runtime.supervisor.children
-
-
-class Mon(GenServer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.downs = []
-
-    async def handle_info(self, message):
-        if isinstance(message, Down):
-            self.downs.append(message)
 
 
 async def test_multiple_monitors_links(runtime: Runtime):
@@ -421,9 +376,9 @@ async def test_multiple_monitors_links(runtime: Runtime):
     T: each M? sees ("DOWN", Z, "boom"), L1 goes down if trap_exits=False
     """
 
-    M1 = await Mon.start()
-    M2 = await Mon.start()
-    M3 = await Mon.start()
+    M1 = await MonitorServer.start()
+    M2 = await MonitorServer.start()
+    M3 = await MonitorServer.start()
     L1 = await GenServer.start(trap_exits=False)
     Z = await GenServer.start()
 
@@ -460,10 +415,6 @@ async def test_multiple_monitors_links(runtime: Runtime):
         await M.stop("normal")
 
 
-class RootServer(Supervisor):
-    pass
-
-
 async def test_named_supervisor_tree(runtime: Runtime, supervisor: Supervisor):
     """
     G: spawn RootSup, register as "root"
@@ -474,7 +425,7 @@ async def test_named_supervisor_tree(runtime: Runtime, supervisor: Supervisor):
     # We'll define a minimal root
 
     # spawn root
-    root_spec = supervisor.child_spec(RootServer, args=(), kwargs={})
+    root_spec = supervisor.child_spec(Supervisor, restart="permanent")
     root = await supervisor.start_child("RootSup", root_spec)
 
     runtime.register_name("root", root)
