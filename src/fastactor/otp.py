@@ -1,5 +1,5 @@
 from abc import ABC
-import asyncio
+from asyncio import CancelledError, gather, as_completed
 from collections import deque
 from dataclasses import dataclass, field
 from time import monotonic
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------
 # Exceptions
 # -----------------------------------------------------------
-class ActorCrashed(Exception):
+class Crashed(Exception):
     pass
 
 
@@ -162,14 +162,16 @@ class Process:
     def has_started(self) -> bool:
         return self._started.is_set()
 
-    async def started(self):
+    async def started(self) -> t.Self:
         await self._started.wait()
+        return self
 
     def has_stopped(self) -> bool:
         return self._stopped.is_set()
 
-    async def stopped(self):
+    async def stopped(self) -> t.Self:
         await self._stopped.wait()
+        return self
 
     async def handle_exit(self, message: Exit):
         """Override in subclass if needed."""
@@ -180,9 +182,9 @@ class Process:
         Called after the main loop ends or if forcibly stopped.
         Subclasses can override for final cleanup.
         """
-        logger.debug("%s terminate %s", self, reason)
-
+        logger.debug("%s terminate reason=%s", self, reason)
         # Notify monitors about our exit
+        logger.debug("%s notifying monitors", self)
         for process in list(self.monitors):
             try:
                 await process.send(Down(self, reason))
@@ -196,6 +198,7 @@ class Process:
                 )
 
         abnormal_shutdown = not _is_normal_shutdown_reason(reason)
+        logger.debug("%s notifying links", self)
         for process in list(self.links):
             if process.trap_exits:
                 try:
@@ -209,13 +212,16 @@ class Process:
                         process,
                     )
             elif abnormal_shutdown:
-                process._crash_exc = (
-                    reason
-                    if isinstance(reason, Exception)
-                    else ActorCrashed(str(reason))
-                )
-                await process.kill()
+                if isinstance(reason, Exception):
+                    process._crash_exc = reason
+                else:
+                    process._crash_exc = Crashed(str(reason))
+                try:
+                    await process.kill()
+                except Exception as error:
+                    logger.error("%r killing %s: %s", error, process, reason)
 
+        logger.debug("%s unlinking", self)
         for process in list(self.links):
             process.unlink(self)
         for process in list(self.monitors):
@@ -224,6 +230,7 @@ class Process:
             process.demonitor(self)
 
         Runtime.current().unregister(self)
+        logger.debug("%s terminated reason=%s", self, reason)
 
     # --------------- Link / Monitor --------------- #
     def link(self, other: "Process"):
@@ -278,11 +285,10 @@ class Process:
     async def handle_info(self, message: Message): ...
 
     # --------------- Internal Loop --------------- #
-    async def _loop(self, *, task_status: TaskStatus[None] = TASK_STATUS_IGNORED):
+    async def _loop(self):
         """
         The main loop: reads messages, calls `_handle_message`.
         """
-        task_status.started()
         self._started.set()
         logger.debug("%s loop started", self)
         while True:
@@ -312,14 +318,15 @@ class Process:
                 await self.handle_info(message)
                 return True
 
-    async def loop(self, *, task_status: TaskStatus[None] = TASK_STATUS_IGNORED):
+    async def loop(self, args, kwargs):
         """
         Wraps `_loop` in a try/finally to detect crashes. Subclasses can override or extend.
         """
+        await self._init(*args, **kwargs)
         async with self._mailbox:
             reason = "normal"
             try:
-                await self._loop(task_status=task_status)
+                await self._loop()
             except Exception as error:
                 self._crash_exc = error
                 reason = error
@@ -458,19 +465,19 @@ ShutdownType = t.Union[int, t.Literal["brutal_kill", "infinity"]]
 RestartStrategy = t.Literal["one_for_one", "one_for_all"]
 
 
-class ChildSpec(t.NamedTuple):
-    type: type[Process]
+class ChildSpec[T: type[Process]](t.NamedTuple):
+    type: T
     args: tuple
     kwargs: dict
     restart_type: RestartType
     shutdown_type: ShutdownType
 
 
-class Child(t.NamedTuple):
+class Child[T: Process](t.NamedTuple):
     child_id: str
-    child_proc: Process
+    child_proc: T
     child_type: str
-    child_modules: list[type[Process]]
+    child_modules: list[type[T]]
 
 
 class RunningChild(t.NamedTuple):
@@ -481,12 +488,15 @@ class RunningChild(t.NamedTuple):
 
 @dataclass(repr=False)
 class Supervisor(Process):
-    child_specs: dict[str, ChildSpec] = field(default_factory=dict)
+    # __init__
+    trap_exits: bool = True
+
+    # init
     strategy: RestartStrategy = "one_for_one"
     max_restarts: int = 3
     max_seconds: float = 5.0
-    trap_exits: bool = True
 
+    child_specs: dict[str, ChildSpec] = field(default_factory=dict)
     children: dict[str, RunningChild] = field(default_factory=dict, init=False)
     _task_group: TaskGroup | None = field(default=None, init=False)
 
@@ -496,10 +506,15 @@ class Supervisor(Process):
     def __eq__(self, other: "Supervisor"):
         return self.id == other.id
 
-    async def init(self, *args, **kwargs):
-        # Called once at supervisor startup
-        # Usually returns None => normal start
-        return None
+    async def init(
+        self,
+        strategy: RestartStrategy = "one_for_one",
+        max_restarts: int = 3,
+        max_seconds: float = 5.0,
+    ):
+        self.strategy = strategy
+        self.max_restarts = max_restarts
+        self.max_seconds = max_seconds
 
     async def terminate(self, reason: t.Any):
         """
@@ -509,7 +524,7 @@ class Supervisor(Process):
             self._shutdown_child(actor, sh, reason)
             for actor, _, sh in list(self.children.values())
         ]
-        await asyncio.gather(*tasks)
+        await gather(*tasks)
         self.children.clear()
 
         await super().terminate(reason)
@@ -538,13 +553,7 @@ class Supervisor(Process):
         else:
             raise ValueError(f"Unsupported shutdown type: {shutdown}")
 
-    async def _run_child(
-        self,
-        child_id: str,
-        child_spec: ChildSpec,
-        *,
-        task_status: TaskStatus[None] = TASK_STATUS_IGNORED,
-    ):
+    async def _run_child(self, child_id: str, child_spec: ChildSpec, ready: Event):
         restart_times = deque()
         while True:
             process = await child_spec.type.start_link(
@@ -557,7 +566,7 @@ class Supervisor(Process):
                 child_spec.restart_type,
                 child_spec.shutdown_type,
             )
-            task_status.started()
+            ready.set()
 
             # Wait for the child to stop
             await process.stopped()
@@ -576,55 +585,73 @@ class Supervisor(Process):
         del self.children[child_id]
 
     async def _one_for_one(self):
-        tasks = [
-            self._task_group.start(self._run_child, child_id, spec)
-            for child_id, spec in self.child_specs.items()
-        ]
-        await asyncio.gather(*tasks)
+        tasks = []
+        for child_id, spec in self.child_specs.items():
+            ready = Event()
+            self._task_group.start_soon(self._run_child, child_id, spec, ready)
+            tasks.append(ready.wait())
+        await gather(*tasks)
 
     async def _one_for_all(self):
+        async def _run_child(child_id, spec):
+            proc = await spec.type.start_link(
+                *spec.args, supervisor=self, **spec.kwargs
+            )
+            self.children[child_id] = (proc, spec.restart_type, spec.shutdown_type)
+            return (child_id, proc, spec.restart_type, spec.shutdown_type)
+
         restarts = deque()
         while True:
-            actors_info = []
-            # Start them all
-            for child_id, spec in self.child_specs.items():
-                proc = await spec.type.start_link(
-                    *spec.args, supervisor=self, **spec.kwargs
-                )
-                self.children[child_id] = (proc, spec.restart_type, spec.shutdown_type)
-                actors_info.append(
-                    (child_id, proc, spec.restart_type, spec.shutdown_type)
-                )
+            actors_info = await gather(
+                *[
+                    _run_child(child_id, spec)
+                    for child_id, spec in self.child_specs.items()
+                ]
+            )
 
-            # Wait for them all to stop
-            reasons = []
-            for _, proc, rst, _ in actors_info:
-                await proc.stopped()
-                reasons.append((proc._crash_exc or "normal", rst))
+            # Wait for any process to stop
+            await as_completed(
+                [proc.stopped() for _, proc, _, _ in actors_info],
+                return_when="FIRST_COMPLETED",
+            )
+            # Get reasons for all processes (stopped or not)
+            reasons = [
+                (proc.has_stopped(), proc._crash_exc or "normal", rst)
+                for _, proc, rst, _ in actors_info
+            ]
 
-            # If any child => abnormal => must restart all
-            if any(self._should_restart(r, rst) for (r, rst) in reasons):
+            # If any child should restart => restart all
+            if any(
+                has_stopped and self._should_restart(reason, restart_type)
+                for (has_stopped, reason, restart_type) in reasons
+            ):
                 now = monotonic()
                 restarts.append(now)
                 while restarts and now - restarts[0] > self.max_seconds:
                     restarts.popleft()
                 if len(restarts) > self.max_restarts:
                     raise ActorFailed("Max restart intensity reached")
-                self.children.clear()
             else:
-                self.children.clear()
                 break
+            self.children.clear()
 
-    async def loop(self, *, task_status: TaskStatus[None] = TASK_STATUS_IGNORED):
+    async def loop(self, args, kwargs):
+        await self._init(*args, **kwargs)
         async with create_task_group() as tg:
             self._task_group = tg
-            if self.strategy == "one_for_one":
-                await self._one_for_one()
-            elif self.strategy == "one_for_all":
-                await self._one_for_all()
-            else:
-                raise ValueError("Unsupported strategy")
-            await super().loop(task_status=task_status)
+
+            await getattr(self, f"_{self.strategy}")()
+
+            async with self._mailbox:
+                reason = "normal"
+                try:
+                    await self._loop()
+                except Exception as error:
+                    self._crash_exc = error
+                    reason = error
+                finally:
+                    await self.terminate(reason)
+                    self._stopped.set()
 
     # --- Child management
     def which_children(self) -> list[Child]:
@@ -671,20 +698,20 @@ class Supervisor(Process):
         if not self._task_group:
             raise RuntimeError("Supervisor not running")
 
-    async def start_child(
-        self,
-        child_id: str,
-        child_spec: ChildSpec,
-    ):
+    async def start_child[
+        T: Process
+    ](self, child_id: str, child_spec: ChildSpec[type[T]]) -> T:
         self._check_task_group()
         if child_id in self.child_specs:
             raise RuntimeError(f"child_id {child_id} already exists")
 
         self.child_specs[child_id] = child_spec
-        await self._task_group.start(self._run_child, child_id, child_spec)
-        return child_id
+        ready = Event()
+        self._task_group.start_soon(self._run_child, child_id, child_spec, ready)
+        await ready.wait()
+        return self.children[child_id].process
 
-    async def restart_child(self, child_id: str):
+    async def restart_child(self, child_id: str) -> Process:
         self._check_task_group()
         if child_id not in self.child_specs:
             raise RuntimeError("No such child_id.")
@@ -694,16 +721,18 @@ class Supervisor(Process):
         await self._task_group.start(
             self._run_child, child_id, self.child_specs[child_id]
         )
+        return self.children[child_id].process
 
-    @beartype
     @staticmethod
-    def child_spec(
-        module_or_map: type[Process],
+    def child_spec[
+        T: type[Process]
+    ](
+        module_or_map: T,
         args: tuple = (),
         kwargs: dict = {},
         restart: RestartType = "permanent",
         shutdown: ShutdownType = 5000,
-    ) -> ChildSpec:
+    ) -> ChildSpec[T]:
         return ChildSpec(module_or_map, args, kwargs, restart, shutdown)
 
 
@@ -722,7 +751,7 @@ class RuntimeSupervisor(Supervisor):
 # Global "Runtime"
 # -----------------------------------------------------------
 @dataclass(repr=False)
-class Runtime(Process):
+class Runtime:
     # Class variables
     _current: t.ClassVar[t.Optional["Runtime"]] = None
     _lock: t.ClassVar[Lock] = Lock()
@@ -734,7 +763,7 @@ class Runtime(Process):
     # Runtime state
     registry: dict[str, str] = field(default_factory=dict, init=False)
     _reverse_registry: dict[str, str] = field(default_factory=dict, init=False)
-    lookup: dict[str, Process] = field(default_factory=dict, init=False)
+    processes: dict[str, Process] = field(default_factory=dict, init=False)
 
     @classmethod
     def current(cls) -> "Runtime":
@@ -745,13 +774,11 @@ class Runtime(Process):
     async def __aenter__(self):
         async with self._lock:
             if Runtime._current is not None:
-                raise SystemAlreadyActive("A System is already active.")
-
-            self.supervisor = RuntimeSupervisor(trap_exits=True)
-            await self.supervisor._init()
+                return Runtime._current
 
             self._task_group = await create_task_group().__aenter__()
-            await self._task_group.start(self.supervisor.loop)
+            self.supervisor = RuntimeSupervisor(trap_exits=True)
+            await self.spawn(self.supervisor)
 
             Runtime._current = self
             return self
@@ -769,18 +796,18 @@ class Runtime(Process):
             Runtime._current = None
 
     async def spawn[P: Process](self, process: P, *args, **kwargs) -> P:
-        await process._init(*args, **kwargs)
         if not process.has_stopped():
-            await self._task_group.start(process.loop)
+            self._task_group.start_soon(process.loop, args, kwargs)
+            await process.started()
 
             self.register(process)
             return process
 
     def register(self, proc: Process):
-        self.lookup[proc.id] = proc
+        self.processes[proc.id] = proc
 
     def unregister(self, proc: Process):
-        del self.lookup[proc.id]
+        del self.processes[proc.id]
         if name := self._reverse_registry.get(proc.id):
             self.unregister_name(name)
 
@@ -794,4 +821,4 @@ class Runtime(Process):
 
     def where_is(self, name: str) -> t.Optional[Process]:
         if id := self.registry.get(name):
-            return self.lookup.get(id)
+            return self.processes.get(id)
