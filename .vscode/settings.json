@@ -10,5 +10,8 @@
     "**/__pycache__": true,
     "**/.pytest_cache": true,
     ".venv/": true
-  }
+  },
+  "python.testing.pytestArgs": ["src"],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true
 }
